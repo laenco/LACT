@@ -13,7 +13,7 @@ use std::{
 };
 
 /// Files which are writeable as-is (reads will return last write's content)
-const WRITEABLE_FILES: &[&str] = &["power_dpm_force_performance_level"];
+const WRITEABLE_FILES: &[&str] = &["power_dpm_force_performance_level", "power1_cap"];
 
 pub struct MockSysfs {
     mirror_fs: MirrorFsReadOnly,

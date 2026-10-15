@@ -37,6 +37,7 @@ use tracing::{error, warn};
 
 pub type DynGpuController = Box<dyn GpuController>;
 type FanControlHandle = (Rc<Notify>, JoinHandle<()>);
+type ThrottleHandle = (Rc<Notify>, JoinHandle<()>);
 
 pub trait GpuController {
     fn controller_type(&self) -> &'static str;

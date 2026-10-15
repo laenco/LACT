@@ -1,5 +1,6 @@
 pub mod fan_control;
 pub mod fdinfo;
+pub mod power_throttle;
 
 use libcopes::PID;
 use std::io;
