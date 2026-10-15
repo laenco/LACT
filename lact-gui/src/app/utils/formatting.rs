@@ -271,6 +271,7 @@ mod tests {
     #[test]
     fn fmt_temperature_text_retains_order() {
         let stats = DeviceStats {
+            power_limit_throttle: None,
             temps: IndexMap::from([
                 (
                     "junction".to_string(),

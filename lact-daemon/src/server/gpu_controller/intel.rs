@@ -899,6 +899,7 @@ impl GpuController for IntelGpuController {
             vram,
             busy_percent: self.get_busy_percent(),
             power,
+            power_limit_throttle: None,
             temps: self.get_temperatures(),
             voltage,
             throttle_info: self.get_throttle_info(),

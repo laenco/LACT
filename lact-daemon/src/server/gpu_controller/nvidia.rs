@@ -1044,6 +1044,7 @@ impl GpuController for NvidiaGpuController {
         let power_constraints = device.power_management_limit_constraints().ok();
 
         DeviceStats {
+            power_limit_throttle: None,
             temps,
             fan: FanStats {
                 control_enabled: gpu_config.is_some_and(|config| config.fan_control_enabled),

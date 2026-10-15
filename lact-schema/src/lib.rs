@@ -631,6 +631,8 @@ pub struct DeviceStats {
     pub voltage: VoltageStats,
     pub vram: VramStats,
     pub power: PowerStats,
+    /// Current state of the automatic power limit throttling, if it is active.
+    pub power_limit_throttle: Option<PowerLimitThrottleStatus>,
     pub temps: IndexMap<String, TemperatureEntry>,
     pub busy_percent: Option<u8>,
     pub performance_level: Option<PerformanceLevel>,
@@ -759,6 +761,21 @@ pub struct PowerStats {
     pub cap_default: Option<f64>,
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub sensors: HashMap<String, f64>,
+}
+
+/// Current state of the automatic power limit throttling.
+#[skip_serializing_none]
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq)]
+pub struct PowerLimitThrottleStatus {
+    /// Power limit which the throttling is not allowed to exceed.
+    pub base_cap: f64,
+    /// Power limit currently set by the throttling.
+    pub effective_cap: f64,
+    /// Whether raising the power limit is currently blocked because of a heavy load.
+    pub load_locked: bool,
+    /// Sensors which are currently above their configured threshold.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub breached: Vec<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
