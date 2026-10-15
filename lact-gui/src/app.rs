@@ -1136,12 +1136,18 @@ impl AppModel {
 
         debug!("updating info for gpu {gpu_id}");
 
-        let gpu_config = self
-            .daemon_client
-            .get_gpu_config(&gpu_id)
-            .await
-            .ok()
-            .flatten();
+        let gpu_config_result = self.daemon_client.get_gpu_config(&gpu_id).await;
+        match &gpu_config_result {
+            Ok(gpu_config) => {
+                self.oc_page.emit(OcPageMsg::PowerLimitThrottle(
+                    gpu_config
+                        .as_ref()
+                        .and_then(|config| config.power_limit_throttle.clone()),
+                ));
+            }
+            Err(err) => debug!("could not fetch gpu config: {err:?}"),
+        }
+        let gpu_config = gpu_config_result.ok().flatten();
 
         let info = self
             .daemon_client
@@ -1249,6 +1255,10 @@ impl AppModel {
         };
 
         // fixme: switch to serialize()
+        self.oc_page
+            .model()
+            .apply_power_throttle_config(&mut gpu_config);
+
         self.thermals_page.model().apply_config(&mut gpu_config);
 
         let delay = self

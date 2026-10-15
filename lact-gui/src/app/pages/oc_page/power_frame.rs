@@ -1,3 +1,4 @@
+use super::power_throttle_dialog::power_throttle_status_line;
 use crate::{
     APP_BROKER, I18N,
     app::{
@@ -19,10 +20,10 @@ use crate::{
 use adw::prelude::*;
 use amdgpu_sysfs::gpu_handle::{PerformanceLevel, power_profile_mode::PowerProfileModesTable};
 use i18n_embed_fl::fl;
-use lact_schema::DeviceStats;
+use lact_schema::{DeviceStats, PowerLimitThrottleStatus, PowerStats};
 use nvml_wrapper::enums::device::PowerMizerMode;
 use relm4::{
-    ComponentController, ComponentParts, ComponentSender, Controller, WidgetTemplate,
+    ComponentController, ComponentParts, ComponentSender, Controller, WidgetTemplate, css,
     factory::FactoryHashMap,
 };
 use std::sync::Arc;
@@ -57,14 +58,24 @@ pub struct PowerFrame {
     rows: FactoryHashMap<PowerSetting, SettingRow<PowerSetting>>,
     supported_power_mizer_modes: Vec<PowerMizerMode>,
     power_profile_mode: Option<Controller<AmdPowerProfileMode>>,
+    /// Explains that the power limit is currently lowered by the daemon throttling.
+    throttle_note: String,
+    /// Power limit shown in the row, used to detect edits made by the user.
+    displayed_cap: Option<f64>,
 }
 
 #[derive(Debug)]
 pub enum PowerFrameMsg {
     Stats(Arc<DeviceStats>),
+    /// Values which the daemon is allowed to change while the page is open.
+    LiveStats {
+        power: PowerStats,
+        throttle: Option<PowerLimitThrottleStatus>,
+    },
     SetPerformanceLevel(PerformanceLevel),
     PowerProfileModes(Option<PowerProfileModesTable>),
     SettingChanged(PowerSetting),
+    ShowThrottleSettings,
     Reset,
 }
 
@@ -92,6 +103,24 @@ impl relm4::Component for PowerFrame {
                 set_visible: !model.rows.is_empty(),
             },
             append_child = model.rows.widget(),
+
+            append_child = &gtk::Label {
+                set_xalign: 0.0,
+                set_wrap: true,
+                add_css_class: css::CAPTION,
+                #[watch]
+                set_label: &model.throttle_note,
+                #[watch]
+                set_visible: !model.throttle_note.is_empty(),
+            },
+
+            append_child = &gtk::Button {
+                set_label: &fl!(I18N, "power-throttle-settings-button"),
+                set_halign: gtk::Align::Start,
+                connect_clicked => PowerFrameMsg::ShowThrottleSettings,
+                #[watch]
+                set_visible: model.rows.get(&PowerSetting::PowerCap).is_some(),
+            },
         },
     }
 
@@ -108,6 +137,8 @@ impl relm4::Component for PowerFrame {
                 }),
             supported_power_mizer_modes: Vec::new(),
             power_profile_mode: None,
+            throttle_note: String::new(),
+            displayed_cap: None,
         };
         let widgets = view_output!();
 
@@ -214,6 +245,14 @@ impl relm4::Component for PowerFrame {
                 }
 
                 self.performance_level_changed(&sender);
+                self.displayed_cap = power.cap_current;
+            }
+            PowerFrameMsg::LiveStats { power, throttle } => {
+                self.throttle_note = throttle_note(throttle.as_ref());
+                self.refresh_power_cap(power.cap_current);
+            }
+            PowerFrameMsg::ShowThrottleSettings => {
+                let _ = sender.output(OcPageMsg::ShowPowerThrottleSettings);
             }
             PowerFrameMsg::SetPerformanceLevel(level) => {
                 if self.rows.get(&PowerSetting::PerformanceLevel).is_some()
@@ -256,6 +295,39 @@ impl relm4::Component for PowerFrame {
 }
 
 impl PowerFrame {
+    /// Keeps the power limit in sync with the value which is in effect, as the daemon
+    /// is allowed to change it while the page is open.
+    fn refresh_power_cap(&mut self, cap: Option<f64>) {
+        let Some(cap) = cap else {
+            return;
+        };
+        let Some(row) = self.rows.get(&PowerSetting::PowerCap) else {
+            return;
+        };
+        let Some(current) = row.get_value().as_numeric() else {
+            return;
+        };
+
+        if (current - cap).abs() < f64::EPSILON {
+            self.displayed_cap = Some(cap);
+            return;
+        }
+
+        // A value being edited by the user must not be taken away from them.
+        let untouched = self
+            .displayed_cap
+            .is_some_and(|shown| (current - shown).abs() < f64::EPSILON);
+        if !untouched {
+            return;
+        }
+
+        self.displayed_cap = Some(cap);
+        self.rows.send(
+            &PowerSetting::PowerCap,
+            SettingRowMsg::RefreshValue(SettingRowValue::Numeric(cap)),
+        );
+    }
+
     pub fn serialize(&self) -> PowerFrameSerialized {
         let value = |setting| self.rows.get(&setting).and_then(SettingRow::serialize);
         let selected = |setting| value(setting).and_then(SettingRowValue::as_selected);
@@ -366,4 +438,116 @@ fn power_mizer_option(mode: PowerMizerMode) -> SelectOption {
         ),
     };
     SelectOption { label, description }
+}
+
+/// Explains that the power limit is currently lower than the configured one.
+fn throttle_note(status: Option<&PowerLimitThrottleStatus>) -> String {
+    let Some(status) = status else {
+        return String::new();
+    };
+    if status.effective_cap + 0.001 >= status.base_cap {
+        return String::new();
+    }
+
+    let mut lines = vec![power_throttle_status_line(status)];
+
+    if !status.breached.is_empty() {
+        lines.push(fl!(
+            I18N,
+            "power-throttle-status-over-threshold",
+            sensors = status.breached.join(", "),
+        ));
+    }
+
+    lines.join("\n")
+}
+
+#[cfg(all(test, feature = "gtk-tests"))]
+mod tests {
+    use super::*;
+    use crate::app::utils::ext::RelmLaunchable;
+
+    fn stats(cap: f64) -> Arc<DeviceStats> {
+        Arc::new(DeviceStats {
+            power: PowerStats {
+                cap_current: Some(cap),
+                cap_default: Some(291.0),
+                cap_min: Some(100.0),
+                cap_max: Some(350.0),
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+    }
+
+    #[test]
+    #[ignore = "requires a GTK display; run explicitly with --ignored"]
+    fn follows_a_power_limit_changed_by_the_daemon() {
+        adw::init().unwrap();
+        let context = gtk::glib::MainContext::default();
+        let _guard = context.acquire().unwrap();
+
+        let frame = PowerFrame::detach(());
+        frame.emit(PowerFrameMsg::Stats(stats(300.0)));
+        while context.pending() {
+            context.iteration(false);
+        }
+        assert_eq!(frame.model().serialize().power_cap, Some(300.0));
+
+        frame.emit(PowerFrameMsg::LiveStats {
+            power: stats(261.0).power.clone(),
+            throttle: Some(PowerLimitThrottleStatus {
+                base_cap: 300.0,
+                effective_cap: 261.0,
+                load_locked: false,
+                breached: vec!["junction".to_owned()],
+            }),
+        });
+        while context.pending() {
+            context.iteration(false);
+        }
+
+        let model = frame.model();
+        let row = model
+            .rows
+            .get(&PowerSetting::PowerCap)
+            .expect("has a power row");
+        assert_eq!(row.get_value().as_numeric(), Some(261.0));
+        // The value set by the daemon must not be treated as an edit of the user.
+        assert_eq!(model.serialize().power_cap, None);
+        assert!(model.throttle_note.contains("junction"));
+    }
+
+    #[test]
+    #[ignore = "requires a GTK display; run explicitly with --ignored"]
+    fn keeps_a_power_limit_being_edited_by_the_user() {
+        adw::init().unwrap();
+        let context = gtk::glib::MainContext::default();
+        let _guard = context.acquire().unwrap();
+
+        let frame = PowerFrame::detach(());
+        frame.emit(PowerFrameMsg::Stats(stats(300.0)));
+        while context.pending() {
+            context.iteration(false);
+        }
+
+        frame.model().rows.send(
+            &PowerSetting::PowerCap,
+            SettingRowMsg::SetValue(SettingRowValue::Numeric(275.0)),
+        );
+        while context.pending() {
+            context.iteration(false);
+        }
+        assert_eq!(frame.model().serialize().power_cap, Some(275.0));
+
+        frame.emit(PowerFrameMsg::LiveStats {
+            power: stats(261.0).power.clone(),
+            throttle: None,
+        });
+        while context.pending() {
+            context.iteration(false);
+        }
+
+        assert_eq!(frame.model().serialize().power_cap, Some(275.0));
+    }
 }

@@ -45,6 +45,9 @@ pub enum AdjustmentControlMsg {
     Changed,
     #[expect(dead_code, reason = "setting-row-migration")]
     SetValueRatio(f64),
+    /// Set the value which is currently in effect, such as when it is changed
+    /// by the daemon. This is not counted as an edit made by the user.
+    RefreshValue(f64),
 }
 
 #[relm4::component(pub)]
@@ -167,6 +170,13 @@ impl Component for AdjustmentControl {
                 widgets
                     .upper_label
                     .set_label(&fmt_value_with_unit(self.adjustment.upper(), &self.unit));
+                self.adjustment.unblock_signal(&widgets.value_change_signal);
+            }
+            AdjustmentControlMsg::RefreshValue(value) => {
+                // A value set by the daemon must not look like an edit made by the user.
+                self.adjustment.block_signal(&widgets.value_change_signal);
+                self.set_value(value);
+                self.default_value = Some(value);
                 self.adjustment.unblock_signal(&widgets.value_change_signal);
             }
         }

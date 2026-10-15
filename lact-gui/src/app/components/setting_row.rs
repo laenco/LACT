@@ -2,13 +2,12 @@ mod adjustment_control;
 mod boolean_control;
 mod select_control;
 
+pub use self::adjustment_control::{AdjustmentControlMsg, AdjustmentInit};
 use self::{
     adjustment_control::AdjustmentControl, boolean_control::BooleanControl,
     select_control::SelectControl,
 };
-#[expect(unused_imports, reason = "setting-row-migration")]
 pub use self::{
-    adjustment_control::{AdjustmentControlMsg, AdjustmentInit},
     boolean_control::BooleanInit,
     select_control::{SelectInit, SelectOption},
 };
@@ -123,6 +122,15 @@ impl<Key> SettingRow<Key> {
                 control.model().set_value(value)
             }
             _ => panic!("setting value does not match the row's control"),
+        }
+    }
+
+    fn refresh_value(&self, value: SettingRowValue) {
+        // Only numeric settings are changed by the daemon for now.
+        if let (SettingControl::Adjustment(control), SettingRowValue::Numeric(value)) =
+            (&self.control, value)
+        {
+            control.emit(AdjustmentControlMsg::RefreshValue(value));
         }
     }
 
@@ -247,6 +255,9 @@ impl SettingControl {
 pub enum SettingRowMsg {
     Reset,
     SetValue(SettingRowValue),
+    /// Set the value which is currently in effect, such as when it is changed
+    /// by the daemon. This is not counted as an edit made by the user.
+    RefreshValue(SettingRowValue),
     #[expect(dead_code, reason = "setting-row-migration")]
     SetVisible(bool),
 }
@@ -291,6 +302,7 @@ impl<Key: Clone + Debug + 'static> FactoryComponent for SettingRow<Key> {
         match msg {
             SettingRowMsg::Reset => self.control.reset(),
             SettingRowMsg::SetValue(value) => self.set_value(value),
+            SettingRowMsg::RefreshValue(value) => self.refresh_value(value),
             SettingRowMsg::SetVisible(visible) => {
                 if widgets.root_row.get_visible() != visible {
                     self.control.set_size_groups_enabled(visible);
