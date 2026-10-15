@@ -1,9 +1,10 @@
 mod drm;
 
-use super::{CommonControllerInfo, FanControlHandle, GpuController};
+use super::{CommonControllerInfo, FanControlHandle, GpuController, ThrottleHandle};
 use crate::server::gpu_controller::common::{
     fan_control::FanCurveExt,
     fdinfo::{self, DrmUtilMap},
+    power_throttle::{PowerThrottle, ThrottleAction, ThrottleObservation},
 };
 use amdgpu_sysfs::{
     error::Error,
@@ -25,9 +26,10 @@ use indexmap::IndexMap;
 use lact_schema::{
     ActivePowerStates, AmdCacheInstance, AmdUmaCarveout, CacheInfo, CacheType, ClocksInfo,
     ClockspeedStats, DeviceApiInfo, DeviceFlag, DeviceInfo, DeviceStats, DeviceType, DrmInfo,
-    FanControlMode, FanStats, LinkInfo, NvidiaThermalInfo, PmfwInfo, PowerState, PowerStates,
-    PowerStats, ProcessList, ProcessUtilizationType, TemperatureEntry, VoltageStats, VramStats,
-    config::{ClocksConfiguration, FanControlSettings, FanCurve, GpuConfig},
+    FanControlMode, FanStats, LinkInfo, NvidiaThermalInfo, PmfwInfo, PowerLimitThrottleStatus,
+    PowerState, PowerStates, PowerStats, ProcessList, ProcessUtilizationType, TemperatureEntry,
+    VoltageStats, VramStats,
+    config::{ClocksConfiguration, FanControlSettings, FanCurve, GpuConfig, PowerLimitThrottle},
 };
 #[cfg(feature = "display-info")]
 use lact_schema::{DisplayConnector, DisplaysInfo};
@@ -50,6 +52,8 @@ const AMDGPU_FAMILY_GC_11_0_0: u32 = 145;
 
 const FAN_CONTROL_RETRIES: u32 = 10;
 const MAX_PSTATE_READ_ATTEMPTS: u32 = 5;
+/// Lower bound for the power limit throttling check interval, in seconds.
+const MIN_THROTTLE_INTERVAL_SECS: u64 = 1;
 const HSA_CACHE_TYPE_DATA: u32 = 0x0000_0001;
 const HSA_CACHE_TYPE_INSTRUCTION: u32 = 0x0000_0002;
 const HSA_CACHE_TYPE_CPU: u32 = 0x0000_0004;
@@ -69,6 +73,8 @@ pub struct AmdGpuController {
     drm_handle: Option<Box<dyn DrmProvider>>,
     common: CommonControllerInfo,
     fan_control_handle: RefCell<Option<FanControlHandle>>,
+    power_throttle_handle: RefCell<Option<ThrottleHandle>>,
+    power_throttle_status: Rc<RefCell<Option<PowerLimitThrottleStatus>>>,
     last_drm_util: RefCell<Option<DrmUtilMap>>,
 }
 
@@ -105,6 +111,8 @@ impl AmdGpuController {
             drm_handle,
             common,
             fan_control_handle: RefCell::new(None),
+            power_throttle_handle: RefCell::new(None),
+            power_throttle_status: Rc::new(RefCell::new(None)),
             last_drm_util: RefCell::new(None),
         })
     }
@@ -419,6 +427,183 @@ impl AmdGpuController {
         }
 
         Ok(())
+    }
+
+    /// Starts a task which lowers the power limit when the device is overheating,
+    /// and raises it back when the temperatures have dropped.
+    ///
+    /// `base_cap` is the power limit which has just been applied from the configuration;
+    /// it is the highest value the throttling is allowed to set.
+    async fn start_power_throttle_task(
+        &self,
+        settings: PowerLimitThrottle,
+        base_cap: f64,
+    ) -> anyhow::Result<()> {
+        if settings.thresholds.is_empty() {
+            bail!("Power limit throttling requires at least one temperature threshold");
+        }
+        if settings.step <= 0.0 {
+            bail!("Power limit throttling step must be greater than 0");
+        }
+
+        self.stop_power_throttle(None).await?;
+
+        let hw_mon = self
+            .handle
+            .hw_monitors
+            .first()
+            .cloned()
+            .context("This GPU has no monitor")?;
+
+        let thresholds = Self::resolve_throttle_thresholds(&hw_mon, &settings.thresholds)?;
+        let (cap_min, cap_max) = match (hw_mon.get_power_cap_min(), hw_mon.get_power_cap_max()) {
+            (Ok(min), Ok(max)) => (min, max),
+            (Err(err), _) | (_, Err(err)) => {
+                bail!("Could not read allowed power limit range: {err:#}");
+            }
+        };
+
+        let min_power = if (cap_min..=cap_max).contains(&settings.min_power) {
+            settings.min_power
+        } else {
+            let clamped = settings.min_power.clamp(cap_min, base_cap);
+            warn!(
+                "Power limit throttling minimum {}W was outside of the allowed range, clamped to {clamped}W",
+                settings.min_power
+            );
+            clamped
+        };
+
+        let settings = PowerLimitThrottle {
+            min_power,
+            thresholds,
+            interval_secs: settings.interval_secs.max(MIN_THROTTLE_INTERVAL_SECS),
+            ..settings
+        };
+        let interval = Duration::from_secs(settings.interval_secs);
+        let mut throttle = PowerThrottle::new(settings, base_cap);
+
+        let notify = Rc::new(Notify::new());
+        let task_notify = notify.clone();
+        let status = self.power_throttle_status.clone();
+
+        debug!("spawning new power limit throttle task");
+        let handle = tokio::task::spawn_local(async move {
+            loop {
+                select! {
+                    () = sleep(interval) => (),
+                    () = task_notify.notified() => break,
+                }
+
+                let temps = hw_mon.get_temps();
+                let current_cap = match hw_mon.get_power_cap() {
+                    Ok(cap) => cap,
+                    Err(err) => {
+                        error!("could not read the current power limit: {err}");
+                        continue;
+                    }
+                };
+                // Not all devices report power usage, then the load lock is not used.
+                let power = hw_mon.get_power_average().ok();
+
+                let action = throttle.evaluate(&ThrottleObservation {
+                    now: Instant::now(),
+                    current_cap,
+                    temps: &temps,
+                    power,
+                });
+                let status_now = throttle.status();
+
+                if let ThrottleAction::SetCap { cap } = action {
+                    let reason = if status_now.breached.is_empty() {
+                        "cooled down"
+                    } else {
+                        "temperature threshold exceeded"
+                    };
+                    info!(
+                        "power limit throttling: {current_cap}W -> {cap}W ({reason}: {})",
+                        status_now.breached.join(", ")
+                    );
+
+                    if let Err(err) = hw_mon.set_power_cap(cap) {
+                        error!("could not set power limit to {cap}W: {err}");
+                    }
+                }
+
+                *status.borrow_mut() = Some(status_now);
+            }
+
+            debug!("exited power limit throttle task");
+            *status.borrow_mut() = None;
+        });
+
+        *self
+            .power_throttle_handle
+            .try_borrow_mut()
+            .map_err(|err| anyhow!("Lock error: {err}"))? = Some((notify, handle));
+
+        Ok(())
+    }
+
+    async fn stop_power_throttle(&self, restore_cap: Option<f64>) -> anyhow::Result<()> {
+        let maybe_handle = self
+            .power_throttle_handle
+            .try_borrow_mut()
+            .map_err(|err| anyhow!("Lock error: {err}"))?
+            .take();
+
+        if let Some((notify, handle)) = maybe_handle {
+            notify.notify_one();
+            handle.await?;
+
+            if let Some(cap) = restore_cap
+                && let Ok(hw_mon) = self.first_hw_mon()
+                && let Err(err) = hw_mon.set_power_cap(cap)
+            {
+                warn!("could not restore the power limit to {cap}W: {err}");
+            }
+        }
+
+        *self.power_throttle_status.borrow_mut() = None;
+        Ok(())
+    }
+
+    /// Maps the configured sensor names onto the sensors which exist on this GPU.
+    ///
+    /// A GPU with a single temperature sensor uses it for all configured thresholds,
+    /// as the name of such a sensor differs between drivers and generations.
+    fn resolve_throttle_thresholds(
+        hw_mon: &HwMon,
+        thresholds: &IndexMap<String, u8>,
+    ) -> anyhow::Result<IndexMap<String, u8>> {
+        let temps = hw_mon.get_temps();
+
+        let missing: Vec<&str> = thresholds
+            .keys()
+            .map(String::as_str)
+            .filter(|name| !temps.contains_key(*name))
+            .collect();
+        if missing.is_empty() {
+            return Ok(thresholds.clone());
+        }
+
+        if temps.len() == 1 {
+            let sensor = temps.keys().next().expect("Has one sensor").clone();
+            let threshold = *thresholds.values().min().expect("Is not empty");
+            warn!(
+                "GPU has only one temperature sensor, power limit throttling will use '{sensor}' for all configured thresholds"
+            );
+            return Ok([(sensor, threshold)].into());
+        }
+
+        let mut available: Vec<&str> = temps.keys().map(String::as_str).collect();
+        available.sort_unstable();
+
+        bail!(
+            "Temperature sensors not found: {}, available sensors: {}",
+            missing.join(", "),
+            available.join(", ")
+        );
     }
 
     fn get_power_states_kind(
@@ -1036,6 +1221,7 @@ impl GpuController for AmdGpuController {
                 cap_default: self.hw_mon_and_then(HwMon::get_power_cap_default),
                 sensors: power_sensors,
             },
+            power_limit_throttle: self.power_throttle_status.borrow().clone(),
             temps,
             busy_percent: self.handle.get_busy_percent().ok(),
             performance_level: self.handle.get_power_force_performance_level().ok(),
@@ -1340,6 +1526,12 @@ impl GpuController for AmdGpuController {
                 }
             }
 
+            // Stopped before the power limit is touched, so that a running throttling
+            // cannot override the value which is being applied.
+            self.stop_power_throttle(None)
+                .await
+                .context("Failed to stop power limit throttling")?;
+
             if let Some(configured_cap) = config.power_cap {
                 let hw_mon = self.first_hw_mon()?;
 
@@ -1411,6 +1603,19 @@ impl GpuController for AmdGpuController {
                 }
             }
 
+            // Started last, so that an invalid throttling configuration cannot stop the
+            // other settings of the device from being applied.
+            if let Some(settings) = config.power_limit_throttle.as_ref() {
+                let hw_mon = self.first_hw_mon()?;
+                let base_cap = hw_mon
+                    .get_power_cap()
+                    .map_err(|err| anyhow!("Could not read the current power limit: {err}"))?;
+
+                self.start_power_throttle_task(settings.clone(), base_cap)
+                    .await
+                    .context("Failed to start power limit throttling")?;
+            }
+
             Ok(())
         })
     }
@@ -1440,6 +1645,15 @@ impl GpuController for AmdGpuController {
                 fan_notify.notify_one();
                 fan_handle.await.unwrap();
                 debug!("finished controller cleanup");
+            }
+
+            let restore_cap = self
+                .power_throttle_status
+                .borrow()
+                .as_ref()
+                .map(|status| status.base_cap);
+            if let Err(err) = self.stop_power_throttle(restore_cap).await {
+                error!("could not stop power limit throttling: {err:#}");
             }
         }
         .boxed_local()
