@@ -50,6 +50,9 @@ pub enum AdjustmentRowMsg {
     ValueRatio(f64),
     /// Set a value as an edit, for example when the user presses Reset.
     SetValue(f64),
+    /// Set the value which is currently in effect, such as when it is changed
+    /// by the daemon. This is not counted as an edit made by the user.
+    RefreshValue(f64),
     SetVisible(bool),
     AddSizeGroup {
         label_group: gtk::SizeGroup,
@@ -247,6 +250,18 @@ impl<Key: 'static> FactoryComponent for AdjustmentRow<Key> {
             }
             AdjustmentRowMsg::SetValue(value) => {
                 self.adjustment.set_value(value * self.value_ratio);
+            }
+            AdjustmentRowMsg::RefreshValue(value) => {
+                // A value set by the daemon must not look like an edit made by the user.
+                self.adjustment.block_signal(&widgets.value_change_signal);
+                widgets.spinbutton.block_signal(&widgets.text_change_signal);
+
+                self.adjustment.set_initial_value(value * self.value_ratio);
+
+                widgets
+                    .spinbutton
+                    .unblock_signal(&widgets.text_change_signal);
+                self.adjustment.unblock_signal(&widgets.value_change_signal);
             }
             AdjustmentRowMsg::SetVisible(visible) => {
                 if widgets.root_row.get_visible() != visible {

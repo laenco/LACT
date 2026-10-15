@@ -127,6 +127,27 @@ settings-confirmation = Do you want to keep the new settings? (Reverting in {$se
 power-cap = Power Limit
 power-section = Power
 
+power-throttle-settings-button = Automatic power limit throttling
+power-throttle-dialog-title = Automatic power limit throttling
+power-throttle-enabled = Lower the power limit when the GPU is too hot
+power-throttle-no-thresholds = Set at least one temperature threshold to enable the throttling
+power-throttle-thresholds = Temperature thresholds
+power-throttle-thresholds-description = The power limit is lowered when a sensor goes above its threshold; zero disables a sensor
+power-throttle-min-power = Lowest power limit (W)
+power-throttle-step = Power limit change step (W)
+power-throttle-hysteresis = Raise the limit after cooling down by (°C)
+power-throttle-interval = Check interval (s)
+power-throttle-load-lock = Do not raise the limit under heavy load
+power-throttle-load-lock-description = Raising the power limit is blocked for a while after the GPU has been using close to its power limit
+power-throttle-load-lock-power = Power usage percentage of the limit
+power-throttle-load-lock-duration = Blocking time after heavy load (s)
+power-throttle-status-lowered = The power limit is currently lowered to {$cap} (highest allowed: {$base})
+power-throttle-status-active = The power limit is currently at its highest allowed value ({$base})
+power-throttle-status-over-threshold = Above threshold: {$sensors}
+power-throttle-status-load-locked = Raising the power limit is blocked by heavy load
+power-throttle-unavailable-sensors = These sensors cannot be used for the power limit throttling: {$sensors}. Set their thresholds to zero to be able to apply the settings.
+power-throttle-sensor-unavailable = This sensor cannot be used by the power limit throttling
+
 watt = W
 ghz = GHz
 mhz = MHz

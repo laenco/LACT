@@ -4,6 +4,7 @@ mod igpu_frame;
 mod performance_frame;
 mod power_frame;
 mod power_states;
+mod power_throttle_dialog;
 mod vf_curve;
 
 use crate::APP_BROKER;
@@ -27,6 +28,7 @@ use nvml_wrapper::enums::device::PowerMizerMode;
 use performance_frame::PerformanceFrameMsg;
 use power_frame::{PowerFrame, PowerFrameMsg};
 use power_states::power_states_dialog::{PowerStatesDialog, PowerStatesDialogMsg};
+use power_throttle_dialog::{PowerThrottleDialog, PowerThrottleDialogMsg};
 use relm4::binding::BoolBinding;
 use relm4::{ComponentController, ComponentParts, ComponentSender, RelmWidgetExt};
 use std::collections::HashSet;
@@ -40,6 +42,7 @@ pub struct OcPage {
 
     power_frame: relm4::Controller<PowerFrame>,
     power_states_dialog: relm4::Controller<PowerStatesDialog>,
+    power_throttle_dialog: relm4::Controller<PowerThrottleDialog>,
     gpu_clocks_frame: relm4::Controller<ClocksFrame>,
     vram_clocks_frame: relm4::Controller<ClocksFrame>,
     igpu_frame: relm4::Controller<IGpuFrame>,
@@ -53,6 +56,8 @@ pub enum OcPageMsg {
         update: PageUpdate,
         initial: bool,
     },
+    /// The power limit throttling section of the device configuration.
+    PowerLimitThrottle(Option<config::PowerLimitThrottle>),
     ClocksTable {
         table: Option<ClocksTable>,
         vf_curve_is_configured: bool,
@@ -66,6 +71,7 @@ pub enum OcPageMsg {
     SetPerformanceLevel(PerformanceLevel),
     EnablePstateConfig,
     ShowPowerStates(ClockDomain),
+    ShowPowerThrottleSettings,
     ShowVfCurveEditor,
     VfCurveEditingToggled(bool),
 }
@@ -152,6 +158,7 @@ impl relm4::Component for OcPage {
         let power_states_dialog =
             PowerStatesDialog::launch_default().forward(sender.input_sender(), |msg| msg);
         let power_frame = PowerFrame::launch_default().forward(sender.input_sender(), |msg| msg);
+        let power_throttle_dialog = PowerThrottleDialog::detach_default();
         let igpu_frame = IGpuFrame::launch_default().forward(sender.input_sender(), |msg| msg);
 
         let vf_curve_editor = VfCurveEditor::detach(VfCurveEditorInit {
@@ -164,6 +171,7 @@ impl relm4::Component for OcPage {
             device_info: None,
             power_frame,
             power_states_dialog,
+            power_throttle_dialog,
             gpu_clocks_frame,
             vram_clocks_frame,
             igpu_frame,
@@ -198,6 +206,29 @@ impl relm4::Component for OcPage {
                     self.vf_curve_editor
                         .emit(VfCurveEditorMsg::Stats(stats.clone()));
 
+                    // The daemon is allowed to change the power limit while the page is open.
+                    self.power_frame.emit(PowerFrameMsg::LiveStats {
+                        power: stats.power.clone(),
+                        throttle: stats.power_limit_throttle.clone(),
+                    });
+                    self.power_throttle_dialog
+                        .emit(PowerThrottleDialogMsg::Capabilities {
+                            min_cap: stats.power.cap_min.unwrap_or_default(),
+                            max_cap: stats.power.cap_max.unwrap_or_default(),
+                            // Sensors which are only shown in the statistics cannot be read
+                            // by the daemon when it adjusts the power limit.
+                            sensors: stats
+                                .temps
+                                .iter()
+                                .filter(|(_, temp)| !temp.display_only)
+                                .map(|(name, _)| name.clone())
+                                .collect(),
+                        });
+                    self.power_throttle_dialog
+                        .emit(PowerThrottleDialogMsg::Status(
+                            stats.power_limit_throttle.clone(),
+                        ));
+
                     if initial {
                         self.power_frame
                             .emit(PowerFrameMsg::PowerStats(stats.power.clone()));
@@ -231,6 +262,16 @@ impl relm4::Component for OcPage {
                         .emit(IGpuFrameMsg::UmaCarveout(uma_carveout));
                 }
             },
+            OcPageMsg::PowerLimitThrottle(settings) => {
+                self.power_throttle_dialog
+                    .emit(PowerThrottleDialogMsg::Config(settings));
+            }
+            OcPageMsg::ShowPowerThrottleSettings => {
+                self.power_throttle_dialog
+                    .emit(PowerThrottleDialogMsg::Show {
+                        parent: root.clone().upcast(),
+                    });
+            }
             OcPageMsg::ClocksTable {
                 table,
                 vf_curve_is_configured,
@@ -341,6 +382,10 @@ impl OcPage {
 
     pub fn get_power_cap(&self) -> Option<f64> {
         self.power_frame.model().get_user_cap()
+    }
+
+    pub fn apply_power_throttle_config(&self, gpu_config: &mut config::GpuConfig) {
+        self.power_throttle_dialog.model().apply_config(gpu_config);
     }
 
     pub fn apply_clocks_config(&self, config: &mut config::ClocksConfiguration) {
