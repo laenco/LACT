@@ -121,6 +121,36 @@ gpus:
       target_temperature: 83
     # Power limit in watts.
     power_cap: 320.0
+    # Automatically lowers the power limit when the GPU is too hot, and raises
+    # it back when it has cooled down. The `power_cap` value (or the default
+    # power limit of the GPU, when `power_cap` is not set) is the highest limit
+    # which the throttling can use.
+    # These settings can also be changed with `lact cli power-limit throttle`.
+    power_limit_throttle:
+      # The lowest power limit in watts that the throttling can set.
+      min_power: 100.0
+      # Maximum temperature of each sensor in degrees, above which the power
+      # limit is lowered. Uses the same sensor names as the fan control
+      # `temperature_key` setting, e.g. `edge`, `junction`, `mem`.
+      thresholds:
+        junction: 92
+        mem: 95
+      # Step in watts used when lowering or raising the power limit.
+      step: 10.0
+      # Interval between the temperature checks in seconds.
+      interval_secs: 2
+      # Number of degrees a temperature has to fall below its threshold before
+      # the power limit is raised back.
+      hysteresis: 5
+      # Blocks raising the power limit while the GPU is under a heavy load, so
+      # that the limit is not undone every time the load changes. Requires a GPU
+      # which reports its power usage, otherwise it is not used.
+      load_lock:
+        # Percentage of the current power limit at which the GPU is considered
+        # to be under a heavy load.
+        power_pct: 90
+        # For how long, in seconds, the power limit is kept from being raised.
+        duration_secs: 300
     # Performance level option for AMD GPUs.
     # Can be `auto`, `low`, `high` or `manual`.
     performance_level: auto
