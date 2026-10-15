@@ -29,6 +29,7 @@ system.
   - Data CSV export
 - #### Power configuration
   - Power cap
+  - Automatic power limit lowering when the GPU is too hot (AMD only)
   - Power states (AMD only)
 - #### Thermals configuration
   - Custom fan curves (AMD/Nvidia)
