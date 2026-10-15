@@ -42,6 +42,17 @@ gpus:
       target_temperature: 83
     power_mizer_mode: Auto
     power_cap: 320
+    power_limit_throttle:
+      min_power: 100
+      thresholds:
+        junction: 92
+        mem: 95
+      step: 10
+      interval_secs: 2
+      hysteresis: 5
+      load_lock:
+        power_pct: 90
+        duration_secs: 300
     performance_level: auto
     min_core_clock: 300
     min_memory_clock: 500
