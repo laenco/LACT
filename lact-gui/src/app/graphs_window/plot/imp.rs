@@ -154,6 +154,7 @@ mod benches {
                 let timestamp = Timestamp::from_millisecond(sec * 1000 + milli).unwrap();
 
                 let stats = DeviceStats {
+                    power_limit_throttle: None,
                     busy_percent: Some(3),
                     clockspeed: ClockspeedStats {
                         gpu_clockspeed: Some(500),

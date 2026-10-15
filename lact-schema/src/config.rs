@@ -44,6 +44,7 @@ pub struct GpuConfig {
     pub nvidia_thermal_options: NvidiaThermalOptions,
     pub power_mizer_mode: Option<PowerMizerMode>,
     pub power_cap: Option<f64>,
+    pub power_limit_throttle: Option<PowerLimitThrottle>,
     pub performance_level: Option<PerformanceLevel>,
     #[serde(default, flatten)]
     pub clocks_configuration: ClocksConfiguration,
@@ -197,6 +198,62 @@ impl GpuConfig {
     }
 }
 
+/// Lowers the power limit when the configured temperature sensors are too hot,
+/// and raises it back when they have cooled down.
+///
+/// `power_cap` is used as the upper bound: the throttling only ever lowers the power limit
+/// and never changes the configuration itself.
+#[skip_serializing_none]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PowerLimitThrottle {
+    /// Lowest power limit in watts that can be set by the throttling.
+    pub min_power: f64,
+    /// Maximum allowed temperature in degrees for each sensor, keyed by its name.
+    /// Uses the same sensor names as `temperature_key` of the fan control settings.
+    pub thresholds: IndexMap<String, u8>,
+    /// Power limit step in watts, used both when lowering and raising the limit.
+    #[serde(default = "default_power_throttle_step")]
+    pub step: f64,
+    /// Interval between temperature checks in seconds.
+    #[serde(default = "default_power_throttle_interval_secs")]
+    pub interval_secs: u64,
+    /// How many degrees below a threshold a sensor has to be for the limit to be raised back.
+    #[serde(default = "default_power_throttle_hysteresis")]
+    pub hysteresis: u8,
+    /// Blocks raising the power limit while the GPU is under a heavy load.
+    pub load_lock: Option<PowerThrottleLoadLock>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+pub struct PowerThrottleLoadLock {
+    /// Power usage at or above this percentage of the current power limit counts as a heavy load.
+    #[serde(default = "default_load_lock_power_pct")]
+    pub power_pct: u8,
+    /// Time in seconds that raising the limit is blocked after a heavy load was seen.
+    #[serde(default = "default_load_lock_duration_secs")]
+    pub duration_secs: u64,
+}
+
+pub fn default_power_throttle_step() -> f64 {
+    10.0
+}
+
+pub fn default_power_throttle_interval_secs() -> u64 {
+    2
+}
+
+pub fn default_power_throttle_hysteresis() -> u8 {
+    5
+}
+
+pub fn default_load_lock_power_pct() -> u8 {
+    90
+}
+
+pub fn default_load_lock_duration_secs() -> u64 {
+    300
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct FanCurve(pub FanCurveMap);
 
@@ -242,7 +299,11 @@ pub fn default_fan_static_speed() -> f32 {
 
 #[cfg(test)]
 mod tests {
-    use super::GpuConfig;
+    use super::{
+        GpuConfig, PowerLimitThrottle, default_load_lock_duration_secs,
+        default_load_lock_power_pct, default_power_throttle_hysteresis,
+        default_power_throttle_interval_secs, default_power_throttle_step,
+    };
 
     #[test]
     fn deserialize_config_json() {
@@ -256,5 +317,45 @@ mod tests {
                 .get(&0)
                 .unwrap()
         );
+    }
+
+    #[test]
+    fn deserialize_power_limit_throttle_with_defaults() {
+        let data =
+            r#"{"power_limit_throttle":{"min_power":100.0,"thresholds":{"junction":92,"mem":95}}}"#;
+        let config: GpuConfig = serde_json::from_str(data).unwrap();
+
+        let throttle = config.power_limit_throttle.unwrap();
+        assert_eq!(throttle.min_power, 100.0);
+        assert_eq!(*throttle.thresholds.get("mem").unwrap(), 95);
+        assert_eq!(throttle.step, default_power_throttle_step());
+        assert_eq!(
+            throttle.interval_secs,
+            default_power_throttle_interval_secs()
+        );
+        assert_eq!(throttle.hysteresis, default_power_throttle_hysteresis());
+        // The load lock is not used unless it is configured.
+        assert_eq!(throttle.load_lock, None);
+
+        let serialized = serde_json::to_string(&throttle).unwrap();
+        let deserialized: PowerLimitThrottle = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(deserialized, throttle);
+    }
+
+    #[test]
+    fn deserialize_power_limit_throttle_load_lock_defaults() {
+        let data = r#"{"power_limit_throttle":{"min_power":100.0,"thresholds":{"junction":92},"load_lock":{}}}"#;
+        let config: GpuConfig = serde_json::from_str(data).unwrap();
+
+        let throttle = config.power_limit_throttle.unwrap();
+        let load_lock = throttle.load_lock.unwrap();
+        assert_eq!(load_lock.power_pct, default_load_lock_power_pct());
+        assert_eq!(load_lock.duration_secs, default_load_lock_duration_secs());
+    }
+
+    #[test]
+    fn power_limit_throttle_is_optional() {
+        let config: GpuConfig = serde_json::from_str("{}").unwrap();
+        assert!(config.power_limit_throttle.is_none());
     }
 }
